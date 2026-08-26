@@ -1,0 +1,138 @@
+"""
+Streamlit interface — lets a planner move the assumptions that actually get
+argued about (service level, shrinkage, AHT, horizon) and see the roster
+consequence immediately.
+
+    streamlit run app.py
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import pandas as pd
+import streamlit as st
+
+sys.path.insert(0, str(Path(__file__).parent))
+
+from src import accuracy, capacity, commentary, data, forecast
+
+st.set_page_config(page_title="Support Volume Forecasting", layout="wide")
+
+
+@st.cache_data(show_spinner=False)
+def load():
+    return data.generate()
+
+
+@st.cache_data(show_spinner="Backtesting models...")
+def backtest(_y: pd.Series, horizon: int, folds: int):
+    ranking = forecast.compare_models(_y, horizon=horizon, folds=folds)
+    best = ranking.iloc[0]["model"]
+    bt = forecast.rolling_origin_backtest(_y, best, horizon=horizon, folds=folds)
+    return ranking, best, bt.frame
+
+
+st.title("Support Volume Forecasting & Capacity Planning")
+st.caption(
+    "Volume forecast → Erlang C staffing → forecast health monitoring → "
+    "variance root-cause"
+)
+
+df = load()
+y = df.volume
+
+# ---------------------------------------------------------------- sidebar
+with st.sidebar:
+    st.header("Forecast")
+    horizon = st.slider("Horizon (days)", 7, 56, 28, step=7)
+    folds = st.slider("Backtest folds", 4, 10, 8)
+
+    st.header("Service target")
+    answer_pct = st.slider("Answer %", 0.70, 0.95, 0.80, step=0.05)
+    within = st.slider("...within (seconds)", 10, 60, 20, step=5)
+    occupancy = st.slider("Max occupancy", 0.75, 0.95, 0.85, step=0.01)
+    shrinkage = st.slider("Shrinkage", 0.15, 0.45, 0.30, step=0.01)
+
+    st.header("Handle time")
+    aht_default = float(df.aht_seconds.tail(28).mean())
+    aht = st.slider("AHT (seconds)", 300, 700, int(aht_default), step=10)
+    hours = st.slider("Operating hours/day", 8.0, 24.0, 12.0, step=1.0)
+
+target = capacity.ServiceTarget(answer_pct, float(within), occupancy, shrinkage)
+
+ranking, best, bt_frame = backtest(y, horizon, folds)
+metrics = accuracy.summary(bt_frame)
+health = accuracy.health_monitor(bt_frame)
+variance = accuracy.decompose_variance(bt_frame, df.is_incident)
+lead = accuracy.accuracy_by_lead_time(bt_frame)
+
+fc = forecast.fit_and_forecast(y, best, horizon=horizon)
+plan = capacity.staffing_plan(fc, float(aht), hours, target)
+
+# ---------------------------------------------------------------- headline
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Selected model", best)
+c2.metric("WAPE", f"{metrics['wape_pct']}%")
+c3.metric("Bias", f"{metrics['bias_pct']:+.2f}%")
+c4.metric("Peak roster", f"{int(plan.agents_rostered.max())} agents")
+
+lift = 100 * (1 - metrics["wape_pct"] /
+              ranking.loc[ranking.model == "SeasonalNaive", "wape_pct"].iloc[0])
+st.caption(f"Improvement over seasonal-naive baseline: {lift:.1f}%")
+
+tabs = st.tabs(["Forecast & roster", "Model health", "Variance", "Review note"])
+
+with tabs[0]:
+    st.subheader("Volume")
+    st.line_chart(
+        pd.concat([y.tail(120).rename("actual"), fc.rename("forecast")], axis=1)
+    )
+    st.subheader("Rostered agent requirement")
+    st.bar_chart(plan.agents_rostered)
+    st.dataframe(plan, width="stretch")
+
+with tabs[1]:
+    st.subheader("Rolling 14-day WAPE against control limit")
+    h = health.dropna(subset=["rolling_wape"]).set_index("date")
+    st.line_chart(h[["rolling_wape", "threshold"]])
+    st.write(f"Breach days: **{int(h.breach.sum())}** of {len(h)} evaluated")
+    st.subheader("Model comparison")
+    st.dataframe(ranking, width="stretch", hide_index=True)
+    st.subheader("Accuracy by lead time")
+    st.bar_chart(lead.set_index("lead_days").wape_pct)
+
+with tabs[2]:
+    st.subheader("Where the error comes from")
+    st.dataframe(variance, width="stretch", hide_index=True)
+    st.caption(
+        "Systematic day-of-week bias is the actionable share — an error the "
+        "model repeats weekly is a specification problem, not noise. Incident "
+        "spikes cannot be forecast and should be excluded from accuracy "
+        "targets, but not hidden."
+    )
+    st.subheader("Cost of forecast error, most recent fold")
+    tail = bt_frame[bt_frame.origin == bt_frame.origin.max()].set_index("date")
+    cost = capacity.cost_of_error(tail.actual, tail.forecast, float(aht),
+                                  target, hours)
+    over = int(cost.loc[cost.agent_gap > 0, "agent_gap"].sum())
+    under = int(-cost.loc[cost.agent_gap < 0, "agent_gap"].sum())
+    a, b = st.columns(2)
+    a.metric("Agent-days over-staffed", over)
+    b.metric("Agent-days under-staffed", under)
+    st.dataframe(cost, width="stretch")
+
+with tabs[3]:
+    ev = commentary.build_evidence(metrics, health, variance, lead, plan, ranking)
+    exceptions = commentary.raise_exceptions(ev)
+    note, source = commentary.generate(ev, exceptions)
+    st.subheader("Automated weekly review note")
+    st.caption(f"Generated by: {source}")
+    st.markdown(note)
+    st.subheader("Exceptions raised by the rule layer")
+    st.dataframe(
+        pd.DataFrame([{"severity": e.severity, "code": e.code, "detail": e.detail}
+                      for e in exceptions]),
+        width="stretch", hide_index=True,
+    )
