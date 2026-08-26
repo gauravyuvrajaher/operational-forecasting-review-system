@@ -7,7 +7,7 @@ translation into how many people to roster.
 Volume forecast → **Erlang C** staffing requirement → **forecast health monitoring** →
 **variance root-cause** → automated review note.
 
-![dashboard](outputs/dashboard.png)
+![dashboard](output/dashboard.png)
 
 ---
 
